@@ -479,7 +479,6 @@ namespace Chimera {
         // apply IP removal if the message is long enough to have an IP in it
         std::wstring message_filtered;
         if(block_ips && length > 6) {
-			// initialize once
             const static std::wregex r(L"\\b(\\d{1,3}\\.){3}\\d{1,3}\\b");
             message_filtered = std::regex_replace(message, r, L"#.#.#.#");
             message = message_filtered.c_str();
@@ -692,14 +691,16 @@ namespace Chimera {
             input_count = reinterpret_cast<std::int16_t*>(data);
         }
 
-        // Handle keyboard input if we have the chat input open
+        // Buffer to accumulate GBK bytes
+        static std::string gbk_buffer;
+
         if(chat_input_open) {
             const auto& [modifier, character, key_code, input_unknown] = input_buffer[*input_count];
             auto num_bytes = chat_input_buffer.length();
 
             // Special key pressed
             if(character == 0xFF) {
-                bool ctrl  = modifier & 0b0000010;
+                bool ctrl = modifier & 0b0000010;
                 auto char_starts = get_char_start_idxs(num_bytes);
 
                 if(key_code == 0) {
@@ -707,127 +708,135 @@ namespace Chimera {
                     chat_open_state_changed = clock::now();
                     chat_message_scroll = 0;
                     enable_input(true);
+                    gbk_buffer.clear(); // Clear GBK buffer on close
                 }
-                // Up arrow / Page up
-                else if(key_code == 0x4D || key_code == 0x53) {
+                else if(key_code == 0x4D || key_code == 0x53) { // Up arrow / Page up
                     if(chat_message_scroll + 1 != MESSAGE_BUFFER_SIZE && chat_messages[chat_message_scroll + 1].valid()) {
                         chat_message_scroll++;
                     }
                 }
-                // Down arrow / Page down
-                else if(key_code == 0x4E || key_code == 0x56) {
+                else if(key_code == 0x4E || key_code == 0x56) { // Down arrow / Page down
                     if(chat_message_scroll > 0) {
                         chat_message_scroll--;
                     }
                 }
-                // Home
-                else if(key_code == 0x52){
+                else if(key_code == 0x52) { // Home
                     chat_input_cursor = 0;
                 }
-                // End
-                else if(key_code == 0x55){
+                else if(key_code == 0x55) { // End
                     chat_input_cursor = num_bytes;
                 }
-                // Left arrow
-                else if(key_code == 0x4F) {
-                    if (ctrl){
-                        // Ctrl + Left: move to start of previous word
-                        while (chat_input_cursor > 0 && chat_input_buffer[chat_input_cursor-1] == ' '){
+                else if(key_code == 0x4F) { // Left arrow
+                    if(ctrl) {
+                        while(chat_input_cursor > 0 && chat_input_buffer[chat_input_cursor-1] == ' ') {
                             chat_input_cursor = next_cursor_pos(char_starts, -1);
                         }
-                        if (chat_input_cursor > 0){
+                        if(chat_input_cursor > 0) {
                             auto new_pos = chat_input_buffer.rfind(' ', chat_input_cursor-1);
                             chat_input_cursor = new_pos != std::string::npos ? new_pos + 1 : 0;
                         }
                     }
-                    else{
+                    else {
                         chat_input_cursor = next_cursor_pos(char_starts, -1);
                     }
                 }
-                // Right arrow
-                else if(key_code == 0x50) {
-                    if (ctrl){
-                        // Ctrl + Right: move to start of next word
-                        if (chat_input_cursor < num_bytes){
+                else if(key_code == 0x50) { // Right arrow
+                    if(ctrl) {
+                        if(chat_input_cursor < num_bytes) {
                             auto new_pos = chat_input_buffer.find(' ', chat_input_cursor);
                             chat_input_cursor = new_pos != std::string::npos ? new_pos + 1 : num_bytes;
                         }
-                        while (chat_input_cursor < num_bytes && chat_input_buffer[chat_input_cursor] == ' '){
+                        while(chat_input_cursor < num_bytes && chat_input_buffer[chat_input_cursor] == ' ') {
                             chat_input_cursor = next_cursor_pos(char_starts, 1);
                         }
                     }
-                    else{
+                    else {
                         chat_input_cursor = next_cursor_pos(char_starts, 1);
                     }
                 }
-                // Backspace
-                else if(key_code == 0x1D) {
+                else if(key_code == 0x1D) { // Backspace
                     auto new_pos = next_cursor_pos(char_starts, -1);
                     chat_input_buffer.erase(new_pos, chat_input_cursor - new_pos);
                     chat_input_cursor = new_pos;
                 }
-                // Delete
-                else if(key_code == 0x54) {
+                else if(key_code == 0x54) { // Delete
                     auto next_pos = next_cursor_pos(char_starts, 1);
                     chat_input_buffer.erase(chat_input_cursor, next_pos - chat_input_cursor);
                 }
-                // Enter
-                else if(key_code == 0x38) {
-                    if(num_bytes > 0 && server_type() != ServerType::SERVER_NONE){
+                else if(key_code == 0x38) { // Enter
+                    if(num_bytes > 0 && server_type() != ServerType::SERVER_NONE) {
                         chat_out(chat_input_channel, chat_input_buffer.c_str());
                     }
                     chat_input_open = false;
                     chat_open_state_changed = clock::now();
                     chat_message_scroll = 0;
                     enable_input(true);
+                    gbk_buffer.clear(); // Clear GBK buffer on enter
                 }
             }
-            // typed a non-control character and there's room left in the buffer
-            else if (!std::iscntrl(character) && num_bytes < INPUT_BUFFER_SIZE - 1) {
+            // Typed a non-control character
+            else if(!std::iscntrl(character) && num_bytes < INPUT_BUFFER_SIZE - 4) { // Reserve space for UTF-8 (up to 4 bytes)
                 bool inserted_emoji = false;
 
-                // check for possible emoji replacement when typing ':'
-                if (chat_input_cursor >= 2 && character == ':'){
+                // Check for emoji replacement
+                if(chat_input_cursor >= 2 && character == ':') {
                     auto start = chat_input_buffer.rfind(':', chat_input_cursor - 1);
-                    if (start != std::string::npos && chat_input_cursor - start > 1) {
+                    if(start != std::string::npos && chat_input_cursor - start > 1) {
                         unsigned int name_len = chat_input_cursor - start - 1;
                         auto emoji_name = chat_input_buffer.substr(start + 1, name_len);
                         try {
-                            // get the emoji from the name (raises exception if not found)
                             auto emoji = EMOJI_MAP.at(emoji_name);
-
-                            // found an emoji, insert it if there's enough space in the buffer
                             unsigned int emoji_len = emoji.length();
                             int added_bytes = emoji_len - (name_len + 1);
-                            if (num_bytes + added_bytes < INPUT_BUFFER_SIZE){
+                            if(num_bytes + added_bytes < INPUT_BUFFER_SIZE) {
                                 chat_input_buffer.erase(start, name_len + 1);
                                 chat_input_buffer.insert(start, emoji);
                                 chat_input_cursor += added_bytes;
                                 inserted_emoji = true;
                             }
                         }
-                        catch (const std::out_of_range& oor) {
-                            // no match, insert the character normally
+                        catch(const std::out_of_range& oor) {
+                            // No match, insert the character normally
                         }
                     }
                 }
-                if (!inserted_emoji) {
-                    // Insert the character normally
+
+                if(!inserted_emoji) {
+                    // Accumulate GBK bytes
+                    gbk_buffer += static_cast<char>(character);
+
+                    // Try to convert GBK to UTF-8
                     if(character >= 0x80) {
-                        // Not enough space
-                        if(num_bytes >= INPUT_BUFFER_SIZE - 2) {
+                        // Check if we have a complete GBK character (2 bytes for Chinese)
+                        if(gbk_buffer.size() >= 2) {
+                            // Convert GBK to UTF-16
+                            wchar_t wchar[2] = {};
+                            int wchar_len = MultiByteToWideChar(936, 0, gbk_buffer.c_str(), gbk_buffer.size(), wchar, sizeof(wchar) / sizeof(wchar[0]));
+                            if(wchar_len > 0) {
+                                // Convert UTF-16 to UTF-8
+                                char utf8[4] = {};
+                                int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wchar, wchar_len, utf8, sizeof(utf8), nullptr, nullptr);
+                                if(utf8_len > 0 && num_bytes + utf8_len < INPUT_BUFFER_SIZE) {
+                                    chat_input_buffer.insert(chat_input_cursor, utf8, utf8_len);
+                                    chat_input_cursor += utf8_len;
+                                    gbk_buffer.clear(); // Clear buffer after successful conversion
+                                }
+                            }
+                            else {
+                                // Incomplete GBK character, wait for more bytes
+                                return;
+                            }
+                        }
+                        else {
+                            // Wait for the second byte of the GBK character
                             return;
                         }
-
-                        // Needs to be converted to UTF-8
-                        chat_input_buffer.insert(chat_input_cursor++, 1, 0xC2 + (character > 0xBF ? 1 : 0));
-                        chat_input_buffer.insert(chat_input_cursor++, 1, 0x80 + (character & 0x3F));
                     }
                     else {
-                        // Can be used as-is
+                        // ASCII character, insert as-is
                         chat_input_buffer.insert(chat_input_cursor++, 1, character);
+                        gbk_buffer.clear(); // Clear GBK buffer for ASCII
                     }
-
                 }
             }
         }
